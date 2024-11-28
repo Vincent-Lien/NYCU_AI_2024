@@ -9,7 +9,8 @@ import torch.optim as optim
 from torchvision import datasets, transforms
 from torch.optim.lr_scheduler import StepLR
 import matplotlib.pyplot as plt
-from tqdm import tqdm
+from torch.utils.data import random_split
+import os
 
 
 class Net(nn.Module):
@@ -117,6 +118,7 @@ def test(model, test_loader, device):
     accuracy = 100. * correct / len(test_loader.dataset)
     print(f'\nTest set: Test Average loss: {test_loss:.4f}, \
         Test Accuracy: {correct}/{len(test_loader.dataset)} ({accuracy:.0f}%)\n')
+    return accuracy
 
 
 def main():
@@ -172,7 +174,6 @@ def main():
     dataset2 = datasets.MNIST('../data', train=False,
                        transform=transform)
 
-    from torch.utils.data import random_split
     train_size = int(0.8 * len(dataset1))
     val_size = len(dataset1) - train_size
     train_dataset, val_dataset = random_split(dataset1, [train_size, val_size])
@@ -194,6 +195,7 @@ def main():
     scheduler = StepLR(optimizer, step_size=1, gamma=args.gamma)
     
     train_losses, val_losses = [], []
+    test_acc = 0
 
     for epoch in range(1, args.epochs + 1):
         # TODO: Return the loss and accuracy of the training loop and plot them
@@ -201,7 +203,7 @@ def main():
         # train(args, model, train_loader, optimizer, epoch)
         # test(model, test_loader)
         train_loss, val_loss = train(args, model, train_loader, val_loader, optimizer, epoch, device)
-        test(model, test_loader, device)
+        test_acc = test(model, test_loader, device)
 
         train_losses.append(train_loss)
         val_losses.append(val_loss)
@@ -216,7 +218,13 @@ def main():
     plt.xlabel('Epoch')
     plt.ylabel('Loss')
     plt.legend()
-    plt.show()
+    
+    # Save to folder
+    output_dir = 'output'
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+    plt.savefig(os.path.join(output_dir, f'loss_{args.model}_batch_{args.batch_size}_epoch_{args.epochs}_lr_{args.lr}_testacc_{test_acc}.png'))
 
     if args.save_model:
         torch.save(model.state_dict(), "mnist.pt")
