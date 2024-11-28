@@ -11,8 +11,6 @@ from torch.optim.lr_scheduler import StepLR
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-print(f"device: {device}\n")
 
 class Net(nn.Module):
     def __init__(self):
@@ -33,38 +31,75 @@ class Net(nn.Module):
         x = self.fc3(x)
         return F.log_softmax(x, dim=1)
 
+class CNN(nn.Module):
+    def __init__(self):
+        super(CNN, self).__init__()
+        self.conv1 = nn.Conv2d(1, 32, 3, 1)
+        self.conv2 = nn.Conv2d(32, 64, 3, 1)
+        self.dropout1 = nn.Dropout(0.25)
+        self.dropout2 = nn.Dropout(0.5)
+        self.fc1 = nn.Linear(9216, 128)
+        self.fc2 = nn.Linear(128, 10)
+    
+    def forward(self, x):
+        x = self.conv1(x)
+        x = F.relu(x)
+        x = self.conv2(x)
+        x = F.relu(x)
+        x = F.max_pool2d(x, 2)
+        x = self.dropout1(x)
+        x = torch.flatten(x, 1)
+        x = self.fc1(x)
+        x = F.relu(x)
+        x = self.dropout2(x)
+        x = self.fc2(x)
+        output = F.log_softmax(x, dim=1)
+        return output
 
-def train(args, model, train_loader, optimizer, epoch):
+
+def train(args, model, train_loader, val_loader, optimizer, epoch, device):
     # Set the model to training mode
     model.train()
     train_loss = 0
-    correct = 0
     # TODO: Define the training loop
-    for batch_idx, (data, target) in enumerate(tqdm(train_loader, desc=f'Train Epoch {epoch}')):
+    for batch_idx, (data, target) in enumerate(train_loader):
         data, target = data.to(device), target.to(device)
         optimizer.zero_grad()
         output = model(data)
         loss = F.nll_loss(output, target)
         train_loss += loss.item()
-        loss.backward()
+        loss.backward()        
         optimizer.step()
         
-        pred = output.argmax(dim=1, keepdim=True)
-        correct += pred.eq(target.view_as(pred)).sum().item()
-        
-        # if batch_idx % args.log_interval == 0:
-        #     print(f'Train Epoch: {epoch} [{batch_idx * len(data)}/{len(train_loader.dataset)}'
-        #           f' ({100. * batch_idx / len(train_loader):.0f}%)]\tLoss: {loss.item():.6f}')
-        #     if args.dry_run:
-        #         break
-    
+        if batch_idx % args.log_interval == 0:
+            print(f'Train Epoch: {epoch} [{batch_idx * len(data)}/{len(train_loader.dataset)}'
+                  f' ({100. * batch_idx / len(train_loader):.0f}%)]\tLoss: {loss.item():.6f}')
+            if args.dry_run:
+                break
+
     train_loss /= len(train_loader.dataset)
-    accuracy = 100. * correct / len(train_loader.dataset)
-    print(f'Train set: Average loss: {train_loss:.4f}, Accuracy: {accuracy:.2f}%')
-    return train_loss, accuracy
+    
+    model.eval()
+    val_loss = 0
+    correct = 0
+    with torch.no_grad():
+        for data, target in val_loader:
+            data, target = data.to(device), target.to(device)
+            output = model(data)
+            val_loss += F.nll_loss(output, target, reduction='sum').item()
+            pred = output.argmax(dim=1, keepdim=True)
+            correct += pred.eq(target.view_as(pred)).sum().item()
+
+    val_loss /= len(val_loader.dataset)
+    val_accuracy = 100. * correct / len(val_loader.dataset)
+
+    print(f'\nEpoch {epoch} Summary:')
+    print(f'Train Loss: {train_loss:.4f}, Validation Loss: {val_loss:.4f}, Validation Accuracy: {val_accuracy:.2f}%')
+    
+    return train_loss, val_loss
 
 
-def test(model, test_loader):
+def test(model, test_loader, device):
     # Set the model to evaluation mode
     model.eval()
     test_loss = 0
@@ -78,12 +113,10 @@ def test(model, test_loader):
             pred = output.argmax(dim=1, keepdim=True)
             correct += pred.eq(target.view_as(pred)).sum().item()
 
-    # Log the testing status
     test_loss /= len(test_loader.dataset)
-    accuracy = 100. * correct / len(test_loader.dataset)    
-    print(f'Test set: Average loss: {test_loss:.4f}, Accuracy: {accuracy:.2f}%\n')
-    return test_loss, accuracy
-
+    accuracy = 100. * correct / len(test_loader.dataset)
+    print(f'\nTest set: Test Average loss: {test_loss:.4f}, \
+        Test Accuracy: {correct}/{len(test_loader.dataset)} ({accuracy:.0f}%)\n')
 
 
 def main():
@@ -107,13 +140,23 @@ def main():
                         help='how many batches to wait before logging training status')
     parser.add_argument('--save-model', action='store_true', default=False,
                         help='For Saving the current Model')
+    parser.add_argument('--model', type=str, default='Net', choices=['Net', 'CNN'],
+                    help='Choose model architecture: Net or CNN (default: Net)')
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
 
+    # Detect GPU
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f'Using device: {device}')
+
     # TODO: Tune the batch size to see different results
     train_kwargs = {'batch_size': args.batch_size}
     test_kwargs = {'batch_size': args.test_batch_size}
+    if device.type == 'cuda':
+        cuda_kwargs = {'num_workers': 2, 'pin_memory': True}
+        train_kwargs.update(cuda_kwargs)
+        test_kwargs.update(cuda_kwargs)
 
     # Set transformation for the dataset
     # TODO: (Bonus) Change different dataset and transformations (data augmentation)
@@ -128,56 +171,55 @@ def main():
                        transform=transform)
     dataset2 = datasets.MNIST('../data', train=False,
                        transform=transform)
-    train_loader = torch.utils.data.DataLoader(dataset1,**train_kwargs)
+
+    from torch.utils.data import random_split
+    train_size = int(0.8 * len(dataset1))
+    val_size = len(dataset1) - train_size
+    train_dataset, val_dataset = random_split(dataset1, [train_size, val_size])
+    train_loader = torch.utils.data.DataLoader(train_dataset, **train_kwargs)
+    val_loader = torch.utils.data.DataLoader(val_dataset, **train_kwargs)
     test_loader = torch.utils.data.DataLoader(dataset2, **test_kwargs)
 
-    model = Net()
+    # Select model based on --model argument
+    if args.model == 'Net':
+        model = Net()
+    elif args.model == 'CNN':
+        model = CNN()
+    model.to(device)  # Move model to GPU if available
+
     # TODO: Tune the learning rate / optimizer to see different results
     optimizer = optim.SGD(model.parameters(), lr=args.lr)
 
     # TODO: Tune the learning rate scheduler to see different results
     scheduler = StepLR(optimizer, step_size=1, gamma=args.gamma)
     
-    train_losses, train_accuracies = [], []
-    test_losses, test_accuracies = [], []
+    train_losses, val_losses = [], []
+
     for epoch in range(1, args.epochs + 1):
         # TODO: Return the loss and accuracy of the training loop and plot them
         # https://matplotlib.org/stable/tutorials/pyplot.html
-        train_loss, train_acc = train(args, model, train_loader, optimizer, epoch)
-        test_loss, test_acc = test(model, test_loader)
-        train_losses.append(train_loss)
-        train_accuracies.append(train_acc)
-        test_losses.append(test_loss)
-        test_accuracies.append(test_acc)
-        scheduler.step()
         # train(args, model, train_loader, optimizer, epoch)
         # test(model, test_loader)
-        # scheduler.step()
+        train_loss, val_loss = train(args, model, train_loader, val_loader, optimizer, epoch, device)
+        test(model, test_loader, device)
+
+        train_losses.append(train_loss)
+        val_losses.append(val_loss)
+
+        scheduler.step()
+
+    # Plotting
+    plt.figure(figsize=(8,6))
+    plt.plot(range(1, args.epochs + 1), train_losses, label='Training Loss')
+    plt.plot(range(1, args.epochs + 1), val_losses, label='Validation Loss')
+    plt.title('Training and Validation Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.show()
 
     if args.save_model:
         torch.save(model.state_dict(), "mnist.pt")
-
-    # Plotting results
-    # plt.figure(figsize=(12, 4))
-    # plt.subplot(1, 2, 1)
-    plt.plot(range(1, args.epochs + 1), train_losses, label='Train Loss')
-    plt.plot(range(1, args.epochs + 1), test_losses, label='Test Loss')
-    # plt.ylim((0, 0.6))
-    plt.legend()
-    plt.xlabel('Epochs')
-    plt.ylabel('Loss')
-    plt.title(f'Loss Curve')
-
-    # plt.subplot(1, 2, 2)
-    # plt.plot(range(1, args.epochs + 1), train_accuracies, label='Train Accuracy')
-    # plt.plot(range(1, args.epochs + 1), test_accuracies, label='Test Accuracy')
-    # plt.legend()
-    # plt.xlabel('Epochs')
-    # plt.ylabel('Accuracy (%)')
-    # plt.title('Accuracy Curve')
-
-    # plt.tight_layout()
-    plt.show()
 
 if __name__ == '__main__':
     main()
